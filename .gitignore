@@ -1,2 +1,7 @@
 .vscode/
 *.ipynb
+.ipynb_checkpoints/
+*.pt
+models/
+bert-base-uncased/
+roberta-base/
