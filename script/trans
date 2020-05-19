@@ -1,0 +1,2 @@
+scp roberta_conv.py oyqy19@cpu1:/home/oyqy19/tweet/bigdata_project/
+CUDA_VISIBLE_DEVICES=7 python roberta_conv.py --bs 8 --mp model_conv_bs8

@@ -122,7 +122,38 @@ class TweetSet(Dataset):
                 result[k] = d[k]
         return result
 
-""" CrossEntropyLoss
+class LinearModel(transformers.BertPreTrainedModel):
+    def __init__(self, conf):
+        super(LinearModel, self).__init__(conf)
+        roberta_path = 'roberta-base/'
+        
+        self.roberta = transformers.RobertaModel.from_pretrained(roberta_path, config=conf)
+        self.dropout = nn.Dropout(0.1)
+        
+        self.classifier= nn.Linear(conf.hidden_size * 2, 2)
+        nn.init.normal_(self.classifier.weight, std=0.02)
+        self.af2 = nn.Softmax(dim=1)
+    
+    def forward(self, input_ids, input_mask, token_types):
+        _, _, out_hiddens = self.roberta(
+            input_ids=input_ids,
+            attention_mask=input_mask,
+            token_type_ids=token_types,
+        )
+        # (bs, MAX_LEN, hidden_size)
+        
+        x = torch.cat((out_hiddens[-1], out_hiddens[-2]), dim=-1)
+        x = self.dropout(x)
+        # (bs, MAX_LEN, hidden_size * 2)
+        
+        x = self.classifier(x)
+        x_start, x_end = x.split(1, dim=-1)
+        x_start = x_start.squeeze(-1)
+        x_end = x_end.squeeze(-1)
+        return self.af2(x_start), self.af2(x_end)
+        # (bs, MAX_LEN) * 2
+
+""" BCELoss
 """
 class TweetModel(transformers.BertPreTrainedModel):
     def __init__(self, conf):
@@ -132,9 +163,11 @@ class TweetModel(transformers.BertPreTrainedModel):
         self.roberta = transformers.RobertaModel.from_pretrained(roberta_path, config=conf)
         self.dropout = nn.Dropout(0.1)
         
-        self.cv1 = nn.Conv1d(MAX_LEN, MAX_LEN, 6, stride=6)
-        self.cv2 = nn.Conv1d(MAX_LEN, MAX_LEN, 2, stride=2) 
+        self.cv1 = nn.Conv1d(self.hs * 2, 256, 2, padding=1)
+        self.bn = nn.BatchNorm1d(256)
         self.af = nn.LeakyReLU()
+        self.cv2 = nn.Conv1d(256, 128, 2) 
+        self.af2 = nn.Softmax(dim=1)
 
         self.classifier= nn.Linear(128, 2)
         nn.init.normal_(self.classifier.weight, std=0.02)
@@ -151,30 +184,50 @@ class TweetModel(transformers.BertPreTrainedModel):
         x = self.dropout(x)
         # (bs, MAX_LEN, hidden_size * 2)
         
+        x = x.permute([0, 2, 1])
+        # (bs, hidden_size * 2, MAX_LEN)
+        
         x = self.cv1(x)
+        x = self.bn(x)
         x = self.af(x)
         x = self.cv2(x)
+        # (bs, 128, MAX_LEN)
+        x = x.permute([0, 2, 1])
+        x = self.dropout(x)
 
         x = self.classifier(x)
         x_start, x_end = x.split(1, dim=-1)
         x_start = x_start.squeeze(-1)
         x_end = x_end.squeeze(-1)
-        return x_start, x_end
-        # (bs, MAX_LEN) * 2
+        return self.af2(x_start), self.af2(x_end)
+        # (bs, MAX_LEN) * 2 
+        # after softmax
         
 class Loss(nn.Module):
     def __init__(self):
         super(Loss, self).__init__()
-        self.f = nn.CrossEntropyLoss()
+        self.f = nn.BCELoss()
+    def forward(self, start, end, start_gt, end_gt):
+        """ (bs, MAX_LEN), (bs, MAX_LEN)
+        """
+        return self.f(start, start_gt.float()) + self.f(end, end_gt.float())
+
+class Loss_nll(nn.Module):
+    def __init__(self):
+        super(Loss_nll, self).__init__()
+        self.f = nn.NLLLoss()
     def forward(self, start, end, start_gt, end_gt):
         """ (bs, MAX_LEN), (bs)
         """
-        return self.f(start, start_gt) + self.f(end, end_gt)
+        return self.f(torch.log(start), start_gt) + self.f(torch.log(end), end_gt)
+
 
 def get_parser():
     parser = argparse.ArgumentParser(description="Roberta based Model")
     parser.add_argument('--bs', default='8')
     parser.add_argument('--mp', default='modelvt')
+    parser.add_argument('--md', default='linear')
+    parser.add_argument('--ls', default='bce')
     return parser
 
 if __name__ == '__main__':
@@ -182,10 +235,15 @@ if __name__ == '__main__':
     args = get_parser().parse_args()
     batch_size = int(args.bs)
     model_path = os.path.join('models', args.mp)
+    model_type = args.md
+    loss_type = args.ls
     if not os.path.exists(model_path):
         os.makedirs(model_path)
     print('batch_size: %s' % batch_size)
     print('model_path: %s' % model_path)
+    print('model_type: %s' % model_type)
+    print('loss_type : %s' % loss_type)
+
     """ model config 
     """
 
@@ -218,6 +276,7 @@ if __name__ == '__main__':
     is_gpu = torch.cuda.is_available()
     device = torch.device('cuda' if is_gpu else 'cpu')
 
+    train_score_list = []
     valid_score_list = []
 
     for fold in range(n_splits):
@@ -226,19 +285,27 @@ if __name__ == '__main__':
         valid_set = TweetSet(train_df[train_df['kfold'] == fold].reset_index(), MAX_LEN)
         train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=4)
         valid_loader = DataLoader(valid_set, batch_size=batch_size)
-        model_id = 'roberta-conv-%d-fold.pt' % (fold + 1)
+        model_id = 'roberta-%s-%d-fold.pt' % (model_type, fold + 1)
         print('data loaded & model creating: %s' % model_id)
-        net = TweetModel(roberta_config)
-        criterion = Loss()
+        if model_type == 'linear':
+            net = LinearModel(roberta_config)
+        else:
+            net = TweetModel(roberta_config)
+        if loss_type == 'bce':
+            criterion = Loss()
+        else:
+            criterion = Loss_nll()
         if is_gpu:
             net.cuda()
             criterion.cuda()
         optimizer = transformers.AdamW(net.parameters(), lr=initial_lr)
         scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda e: (0.2 ** e))
         
+        train_score_list2 = []
         valid_score_max = -np.inf
         for e in range(1, max_epochs + 1):
             train_loss = 0.0
+            train_score = 0.0
             valid_score = 0.0
             
             net.train()
@@ -247,8 +314,10 @@ if __name__ == '__main__':
                 ids, masks, types = tp['ids'], tp['masks'], tp['types']
                 if is_gpu:
                     ids, masks, types = ids.cuda(), masks.cuda(), types.cuda()
-                
-                start_gt, end_gt = tp['start_pos'], tp['end_pos']
+                if loss_type == 'bce':
+                    start_gt, end_gt = tp['start_tokens'], tp['end_tokens']
+                else:
+                    start_gt, end_gt = tp['start_pos'], tp['end_pos']
                 if is_gpu:
                     start_gt, end_gt = start_gt.cuda(), end_gt.cuda()
                 
@@ -257,6 +326,23 @@ if __name__ == '__main__':
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
+
+                offsets = tp["offsets"].numpy()
+                ori = tp['ori']
+                ori_s = tp['ori_s']
+                labels = tp['label']
+                start_pt = start_pt.cpu().detach().numpy()
+                end_pt = end_pt.cpu().detach().numpy()
+                lens = tp['length'].numpy()
+
+                for j, text1 in enumerate(ori):
+                    text2 = get_selected_text(
+                        text1, offsets[j], 
+                        np.argmax(start_pt[j]), 
+                        np.argmax(end_pt[j]), 
+                        labels[j], lens[j]
+                    )
+                    train_score += jaccard(ori_s[j], text2)
                 
                 train_loss += loss.item() * ids.shape[0] / len(train_set)
                 bar.set_postfix(ordered_dict={'train_loss': loss.item()})
@@ -274,8 +360,8 @@ if __name__ == '__main__':
                     ori = tp['ori']
                     ori_s = tp['ori_s']
                     labels = tp['label']
-                    start_pt = torch.softmax(start_pt, dim=1).cpu().detach().numpy()
-                    end_pt = torch.softmax(end_pt, dim=1).cpu().detach().numpy()
+                    start_pt = start_pt.cpu().detach().numpy()
+                    end_pt = end_pt.cpu().detach().numpy()
                     lens = tp['length'].numpy()
                     
                     for j, text1 in enumerate(ori):
@@ -287,21 +373,27 @@ if __name__ == '__main__':
                         )
                         valid_score += jaccard(ori_s[j], text2)
             
+            train_score /= len(train_set)
             valid_score /= len(valid_set)
             lr = optimizer.param_groups[0]['lr']
-            print('[epoch:%s]: valid_score=%s, lr=%s' % (e, valid_score, lr))
+            print('[epoch:%s]: train_score=%s, valid_score=%s, lr=%s' % (
+                e, train_score, valid_score, lr
+            ))
             scheduler.step()
             
             if valid_score > valid_score_max:
                 print('[%s > %s]: model update, saving...' % (valid_score, valid_score_max))
                 torch.save(net.state_dict(), os.path.join(model_path, model_id))
                 valid_score_max = valid_score
+            train_score_list2.append(train_score)
 
         valid_score_list.append(valid_score_max)
+        train_score_list.append(train_score_list2)
 
     """ output result
     """
     result = {
+        'train_score': train_score_list,
         'valid_score': valid_score_list,
         'mean_valid_score': np.mean(valid_score_list)
     }
